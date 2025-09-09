@@ -1,0 +1,29 @@
+# Core Data Science & Analysis
+pandas
+numpy
+scikit-learn
+scipy
+
+# Database Connection
+sqlalchemy
+psycopg2-binary
+
+# Visualization
+matplotlib
+seaborn
+
+# MLOps - Experiment Tracking
+mlflow
+
+# Deep Learning & NLP
+# Note: Installs PyTorch for CPU-only, which is perfect for your setup
+torch
+transformers
+sentence-transformers
+
+# API Development
+fastapi
+uvicorn[standard]
+
+# Environment & Utilities
+python-dotenv
