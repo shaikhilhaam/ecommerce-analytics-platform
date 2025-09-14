@@ -11,12 +11,14 @@ psycopg2-binary
 # Visualization
 matplotlib
 seaborn
+plotly
+nbformat
 
 # MLOps - Experiment Tracking
 mlflow
 
 # Deep Learning & NLP
-# Note: Installs PyTorch for CPU-only, which is perfect for your setup
+# Note: Installs PyTorch for CPU-only
 torch
 transformers
 sentence-transformers
