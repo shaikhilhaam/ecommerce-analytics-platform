@@ -3,7 +3,7 @@ import os
 from sqlalchemy import create_engine
 from dotenv import load_dotenv
 from src.data_processing import create_master_table_from_db
-from src.feature_engineering import create_ltv_features
+from src.feature_engineering import create_propensity_features # <-- Import the new function
 
 def main():
     """Main function to run the data processing and feature engineering pipeline."""
@@ -17,13 +17,13 @@ def main():
     # Step 1: Create master table from the database
     master_df = create_master_table_from_db(engine)
 
-    # Step 2: Create features for LTV modeling
-    modeling_df = create_ltv_features(master_df)
+    # Step 2: Create features for the propensity model
+    modeling_df = create_propensity_features(master_df) # <-- Call the new function
 
-    # Step 3: Save the final modeling dataset
-    modeling_data_path = 'data/processed/modeling_dataset.csv'
+    # Step 3: Save the final modeling dataset to a new file
+    modeling_data_path = 'data/processed/propensity_dataset.csv' # <-- New output filename
     modeling_df.to_csv(modeling_data_path, index=False)
-    print(f"Modeling dataset saved to {modeling_data_path}")
+    print(f"Propensity modeling dataset saved to {modeling_data_path}")
 
 if __name__ == "__main__":
     main()
