@@ -4,13 +4,19 @@ import numpy as np
 
 def create_ltv_features(master_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Creates the feature set and target variable for the LTV prediction model.
+    Creates an enhanced feature set and the target variable for the LTV prediction model.
     """
+    # --- Create Seller-level Features (from our Advanced EDA) ---
+    delivered_df = master_df[master_df['order_status'] == 'delivered'].copy()
+    seller_df = delivered_df.groupby('seller_id').agg(
+        seller_avg_review_score=('review_score', 'mean'),
+        seller_num_orders=('order_id', 'nunique')
+    ).reset_index()
+
     # Find the first purchase for each customer
     first_purchase_df = master_df.loc[master_df.groupby('customer_unique_id')['order_purchase_timestamp'].idxmin()]
 
     # --- Create the Target Variable (ltv_90_days) ---
-    # FIX: Added include_groups=False to silence the FutureWarning
     target_df = master_df.groupby('customer_unique_id', group_keys=False).apply(
         lambda x: x[
             (x['order_purchase_timestamp'] > x['order_purchase_timestamp'].min()) &
@@ -20,22 +26,30 @@ def create_ltv_features(master_df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(name='ltv_90_days')
 
     # --- Create Features from the First Purchase ---
-    feature_df = first_purchase_df[[
+    feature_df = pd.merge(first_purchase_df, seller_df, on='seller_id', how='left')
+    
+    feature_df['first_purchase_month'] = feature_df['order_purchase_timestamp'].dt.month
+    feature_df['first_purchase_dayofweek'] = feature_df['order_purchase_timestamp'].dt.dayofweek
+
+    feature_df = feature_df[[
         'customer_unique_id', 'payment_value', 'payment_installments', 'review_score',
-        'freight_value', 'product_category', 'product_photos_qty', 'product_description_lenght'
+        'freight_value', 'product_category', 'customer_state',
+        'first_purchase_month', 'first_purchase_dayofweek',
+        'seller_avg_review_score', 'seller_num_orders'
     ]].copy()
 
     # --- Combine into the Final Modeling Dataset ---
     modeling_df = pd.merge(feature_df, target_df, on='customer_unique_id')
 
-    # FIX: Avoid inplace=True and use direct assignment to prevent SettingWithCopyWarning
+    # FIX: Avoid inplace=True and use direct assignment
     modeling_df['review_score'] = modeling_df['review_score'].fillna(modeling_df['review_score'].median())
-    modeling_df['product_photos_qty'] = modeling_df['product_photos_qty'].fillna(modeling_df['product_photos_qty'].median())
-    modeling_df['product_description_lenght'] = modeling_df['product_description_lenght'].fillna(modeling_df['product_description_lenght'].median())
+    modeling_df['seller_avg_review_score'] = modeling_df['seller_avg_review_score'].fillna(modeling_df['seller_avg_review_score'].median())
+    modeling_df['seller_num_orders'] = modeling_df['seller_num_orders'].fillna(0)
     modeling_df['product_category'] = modeling_df['product_category'].fillna('unknown')
 
-    # Convert categorical feature into numerical using one-hot encoding
-    modeling_df = pd.get_dummies(modeling_df, columns=['product_category'], drop_first=True, dtype=int)
+    # Convert categorical features into numerical using one-hot encoding
+    cat_cols = ['product_category', 'customer_state']
+    modeling_df = pd.get_dummies(modeling_df, columns=cat_cols, drop_first=True, dtype=int)
 
-    print("Feature engineering for LTV prediction complete.")
+    print("Enriched feature engineering for LTV prediction complete.")
     return modeling_df
