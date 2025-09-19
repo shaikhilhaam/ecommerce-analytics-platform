@@ -3,41 +3,41 @@ import pandas as pd
 import mlflow
 import mlflow.xgboost
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import f1_score
 import xgboost as xgb
 import os
-from imblearn.over_sampling import SMOTE
+import optuna # <-- Import Optuna
 
-def train_model(X_train, X_test, y_train, y_test, params, run_name):
-    # This function remains the same
-    with mlflow.start_run(run_name=run_name) as run:
-        print(f"--- Starting MLflow Run: {run.info.run_name} ---")
-        model = xgb.XGBClassifier(**params)
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        
-        accuracy = accuracy_score(y_test, y_pred)
-        precision = precision_score(y_test, y_pred)
-        recall = recall_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred)
-        
-        print(f"Run '{run_name}': Accuracy={accuracy:.3f}, F1={f1:.3f}, Precision={precision:.3f}, Recall={recall:.3f}")
+def objective(trial, X_train, y_train, X_test, y_test):
+    """
+    The objective function for Optuna to optimize.
+    A 'trial' is a single run with a specific set of hyperparameters.
+    """
+    # Define the hyperparameter search space
+    params = {
+        'objective': 'binary:logistic',
+        'eval_metric': 'logloss',
+        'use_label_encoder': False,
+        'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=100),
+        'max_depth': trial.suggest_int('max_depth', 3, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+        'gamma': trial.suggest_float('gamma', 0, 5),
+        # We keep our best imbalance handling technique constant
+        'scale_pos_weight': (y_train == 0).sum() / (y_train == 1).sum()
+    }
 
-        mlflow.log_params(params)
-        mlflow.log_metric("accuracy", accuracy)
-        mlflow.log_metric("precision", precision)
-        mlflow.log_metric("recall", recall)
-        mlflow.log_metric("f1_score", f1)
-        
-        input_example = X_train.head()
-        mlflow.xgboost.log_model(
-            xgb_model=model,
-            name="xgboost-propensity-model",
-            input_example=input_example
-        )
+    model = xgb.XGBClassifier(**params)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    
+    # We want to maximize the F1 score, as it balances precision and recall
+    f1 = f1_score(y_test, y_pred)
+    return f1
 
 def main():
-    """Main function to load data and run multiple training experiments."""
+    """Main function to run hyperparameter tuning with Optuna."""
     mlflow.set_tracking_uri("sqlite:///mlflow_data/mlflow.db")
     mlflow.set_experiment("Repeat Purchase Propensity")
 
@@ -48,39 +48,45 @@ def main():
     y = modeling_df['is_repeat']
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # --- FIX: Impute any remaining NaNs before using SMOTE ---
-    print("Imputing remaining missing values...")
+    # Impute missing values (as before)
     for col in X_train.columns:
         if X_train[col].isnull().any():
             median_val = X_train[col].median()
             X_train[col] = X_train[col].fillna(median_val)
             X_test[col] = X_test[col].fillna(median_val)
-    print("Imputation complete.")
+            
+    # --- Run Optuna Study ---
+    study = optuna.create_study(direction='maximize')
+    # Pass the data to the objective function using a lambda
+    study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=20)
 
-    # --- Run Baseline Experiment (with class imbalance handling) ---
-    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
-    imbalance_params = {
-        'objective': 'binary:logistic', 'n_estimators': 200, 'max_depth': 4,
-        'learning_rate': 0.05, 'use_label_encoder': False, 'eval_metric': 'logloss',
-        'scale_pos_weight': scale_pos_weight
-    }
-    train_model(X_train, X_test, y_train, y_test, params=imbalance_params, run_name="Baseline (with scale_pos_weight)")
+    print("Optuna study finished.")
+    print("Best trial F1-score:", study.best_value)
+    print("Best parameters found: ", study.best_params)
 
-    # --- Run NEW Experiment: SMOTE Resampling ---
-    print("\nApplying SMOTE to the training data...")
-    smote = SMOTE(random_state=42)
-    X_train_smote, y_train_smote = smote.fit_resample(X_train, y_train)
+    # --- Train and log the final best model using the best params ---
+    best_params = study.best_params
+    best_params['scale_pos_weight'] = (y_train == 0).sum() / (y_train == 1).sum() # Re-add our constant param
     
-    print(f"Original training set shape: {y_train.value_counts().to_dict()}")
-    print(f"SMOTE resampled training set shape: {y_train_smote.value_counts().to_dict()}")
-
-    smote_params = {
-        'objective': 'binary:logistic', 'n_estimators': 200, 'max_depth': 4,
-        'learning_rate': 0.05, 'use_label_encoder': False, 'eval_metric': 'logloss'
-    }
-    train_model(X_train_smote, X_test, y_train_smote, y_test, params=smote_params, run_name="SMOTE Resampling")
-
-    print("\nAll experiments complete. Check the MLflow UI!")
+    with mlflow.start_run(run_name="Optimized Model (Optuna)") as run:
+        print(f"--- Starting Final Model Training with Best Params ---")
+        model = xgb.XGBClassifier(**best_params)
+        model.fit(X_train, y_train)
+        
+        # Log everything for the best model
+        mlflow.log_params(best_params)
+        # You can re-calculate and log all metrics here if you want
+        y_pred = model.predict(X_test)
+        f1 = f1_score(y_test, y_pred)
+        mlflow.log_metric("f1_score", f1)
+        
+        input_example = X_train.head()
+        mlflow.xgboost.log_model(
+            xgb_model=model,
+            name="xgboost-propensity-model-optimized",
+            input_example=input_example
+        )
+        print("Final optimized model logged to MLflow.")
 
 if __name__ == "__main__":
     main()
