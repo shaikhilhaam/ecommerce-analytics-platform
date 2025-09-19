@@ -3,6 +3,9 @@ pandas
 numpy
 scikit-learn
 scipy
+nltk
+wordcloud
+notebook
 
 # Database Connection
 sqlalchemy
