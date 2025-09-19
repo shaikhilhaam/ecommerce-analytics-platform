@@ -6,6 +6,7 @@ scipy
 nltk
 wordcloud
 notebook
+xgboost
 
 # Database Connection
 sqlalchemy
