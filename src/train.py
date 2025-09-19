@@ -1,92 +1,112 @@
 # src/train.py
 import pandas as pd
+import numpy as np
 import mlflow
-import mlflow.xgboost
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import f1_score
-import xgboost as xgb
+import mlflow.lightgbm
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, precision_score, recall_score
+import lightgbm as lgb
 import os
-import optuna # <-- Import Optuna
-
-def objective(trial, X_train, y_train, X_test, y_test):
-    """
-    The objective function for Optuna to optimize.
-    A 'trial' is a single run with a specific set of hyperparameters.
-    """
-    # Define the hyperparameter search space
-    params = {
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
-        'use_label_encoder': False,
-        'n_estimators': trial.suggest_int('n_estimators', 100, 1000, step=100),
-        'max_depth': trial.suggest_int('max_depth', 3, 10),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
-        'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-        'gamma': trial.suggest_float('gamma', 0, 5),
-        # We keep our best imbalance handling technique constant
-        'scale_pos_weight': (y_train == 0).sum() / (y_train == 1).sum()
-    }
-
-    model = xgb.XGBClassifier(**params)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
-    
-    # We want to maximize the F1 score, as it balances precision and recall
-    f1 = f1_score(y_test, y_pred)
-    return f1
 
 def main():
-    """Main function to run hyperparameter tuning with Optuna."""
+    """
+    Main function to run cross-validation training with LightGBM
+    and log the results to MLflow.
+    """
     mlflow.set_tracking_uri("sqlite:///mlflow_data/mlflow.db")
     mlflow.set_experiment("Repeat Purchase Propensity")
 
-    data_path = os.path.join('data', 'processed', 'propensity_dataset.csv')
+    # Load the dataset with advanced features
+    data_path = os.path.join('data', 'processed', 'propensity_dataset_advanced.csv')
     modeling_df = pd.read_csv(data_path)
 
     X = modeling_df.drop(columns=['customer_unique_id', 'is_repeat'])
     y = modeling_df['is_repeat']
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     # Impute missing values (as before)
-    for col in X_train.columns:
-        if X_train[col].isnull().any():
-            median_val = X_train[col].median()
-            X_train[col] = X_train[col].fillna(median_val)
-            X_test[col] = X_test[col].fillna(median_val)
-            
-    # --- Run Optuna Study ---
-    study = optuna.create_study(direction='maximize')
-    # Pass the data to the objective function using a lambda
-    study.optimize(lambda trial: objective(trial, X_train, y_train, X_test, y_test), n_trials=20)
+    for col in X.columns:
+        if X[col].isnull().any():
+            X[col] = X[col].fillna(X[col].median())
 
-    print("Optuna study finished.")
-    print("Best trial F1-score:", study.best_value)
-    print("Best parameters found: ", study.best_params)
-
-    # --- Train and log the final best model using the best params ---
-    best_params = study.best_params
-    best_params['scale_pos_weight'] = (y_train == 0).sum() / (y_train == 1).sum() # Re-add our constant param
+    # --- Stratified K-Fold Cross-Validation ---
+    # Stratification ensures each fold has the same proportion of repeaters/non-repeaters
+    n_splits = 5
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     
-    with mlflow.start_run(run_name="Optimized Model (Optuna)") as run:
-        print(f"--- Starting Final Model Training with Best Params ---")
-        model = xgb.XGBClassifier(**best_params)
-        model.fit(X_train, y_train)
+    # Define model parameters (a strong baseline for LightGBM)
+    params = {
+        'objective': 'binary',
+        'metric': 'binary_logloss',
+        'n_estimators': 1000,
+        'learning_rate': 0.05,
+        'feature_fraction': 0.8,
+        'bagging_fraction': 0.8,
+        'bagging_freq': 1,
+        'verbose': -1,
+        'n_jobs': -1,
+        'seed': 42,
+        'boosting_type': 'gbdt',
+        'scale_pos_weight': (y == 0).sum() / (y == 1).sum()
+    }
+    
+    fold_metrics = []
+
+    # Start a parent MLflow run to group the cross-validation runs
+    with mlflow.start_run(run_name=f"LGBM_CrossValidation_{n_splits}_folds") as parent_run:
+        mlflow.log_params(params)
         
-        # Log everything for the best model
-        mlflow.log_params(best_params)
-        # You can re-calculate and log all metrics here if you want
-        y_pred = model.predict(X_test)
-        f1 = f1_score(y_test, y_pred)
-        mlflow.log_metric("f1_score", f1)
+        for fold, (train_index, val_index) in enumerate(skf.split(X, y)):
+            # Start a nested run for each fold
+            with mlflow.start_run(run_name=f"fold_{fold+1}", nested=True) as child_run:
+                print(f"--- Starting Fold {fold+1}/{n_splits} ---")
+                
+                X_train, X_val = X.iloc[train_index], X.iloc[val_index]
+                y_train, y_val = y.iloc[train_index], y.iloc[val_index]
+
+                model = lgb.LGBMClassifier(**params)
+                model.fit(X_train, y_train,
+                          eval_set=[(X_val, y_val)],
+                          eval_metric='f1',
+                          callbacks=[lgb.early_stopping(100, verbose=False)])
+                
+                y_pred = model.predict(X_val)
+                
+                f1 = f1_score(y_val, y_pred)
+                precision = precision_score(y_val, y_pred)
+                recall = recall_score(y_val, y_pred)
+                
+                fold_metrics.append({'f1': f1, 'precision': precision, 'recall': recall})
+                
+                mlflow.log_metric("f1_score", f1)
+                mlflow.log_metric("precision", precision)
+                mlflow.log_metric("recall", recall)
+
+        # --- Log average metrics to the parent run ---
+        avg_f1 = np.mean([m['f1'] for m in fold_metrics])
+        avg_precision = np.mean([m['precision'] for m in fold_metrics])
+        avg_recall = np.mean([m['recall'] for m in fold_metrics])
         
-        input_example = X_train.head()
-        mlflow.xgboost.log_model(
-            xgb_model=model,
-            name="xgboost-propensity-model-optimized",
-            input_example=input_example
+        print("\n--- Cross-Validation Summary ---")
+        print(f"Average F1-Score: {avg_f1:.3f}")
+        print(f"Average Precision: {avg_precision:.3f}")
+        print(f"Average Recall: {avg_recall:.3f}")
+        
+        mlflow.log_metric("avg_f1_score", avg_f1)
+        mlflow.log_metric("avg_precision", avg_precision)
+        mlflow.log_metric("avg_recall", avg_recall)
+
+        # --- Train Final Model on All Data ---
+        print("\n--- Training Final Model on All Data ---")
+        final_model = lgb.LGBMClassifier(**params)
+        final_model.fit(X, y) # Train on the entire dataset
+        
+        # Log the final model
+        mlflow.lightgbm.log_model(
+            lgb_model=final_model,
+            name="lightgbm-propensity-model-final",
+            input_example=X.head()
         )
-        print("Final optimized model logged to MLflow.")
+        print("Final model logged to MLflow.")
 
 if __name__ == "__main__":
     main()

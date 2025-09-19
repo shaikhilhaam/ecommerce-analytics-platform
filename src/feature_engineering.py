@@ -1,22 +1,24 @@
 # src/feature_engineering.py
 import pandas as pd
 import numpy as np
+from sklearn.decomposition import PCA
+from sentence_transformers import SentenceTransformer
+from haversine import haversine, Unit
 
-def create_propensity_features(master_df: pd.DataFrame) -> pd.DataFrame:
+def create_propensity_features(master_df: pd.DataFrame, geo_df: pd.DataFrame) -> pd.DataFrame:
     """
     Creates the final, most advanced feature set for the repeat purchase propensity model.
     """
-    # --- Create Seller-level Features (as before) ---
+    # --- 1. Engineer Delivery & Seller Features (as before) ---
     delivered_df = master_df[master_df['order_status'] == 'delivered'].copy()
     seller_df = delivered_df.groupby('seller_id').agg(
         seller_avg_review_score=('review_score', 'mean'),
         seller_num_orders=('order_id', 'nunique')
     ).reset_index()
 
-    # Find the first purchase for each customer
     first_purchase_df = master_df.loc[master_df.groupby('customer_unique_id')['order_purchase_timestamp'].idxmin()]
 
-    # --- Create the Target Variable (is_repeat) ---
+    # --- 2. Create the Target Variable (as before) ---
     ltv_df = master_df.groupby('customer_unique_id', group_keys=False).apply(
         lambda x: x[
             (x['order_purchase_timestamp'] > x['order_purchase_timestamp'].min()) &
@@ -26,42 +28,67 @@ def create_propensity_features(master_df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index(name='ltv_90_days')
     ltv_df['is_repeat'] = (ltv_df['ltv_90_days'] > 0).astype(int)
     target_df = ltv_df[['customer_unique_id', 'is_repeat']]
-
-    # --- Engineer NEW Advanced Features ---
-    # 1. Delivery Performance Features for the first order
-    first_purchase_df['delivery_time_vs_estimated'] = \
-        (first_purchase_df['order_estimated_delivery_date'] - first_purchase_df['order_delivered_customer_date']).dt.days
     
-    # 2. Was the first order early?
-    first_purchase_df['first_order_was_early'] = \
-        (first_purchase_df['delivery_time_vs_estimated'] > 0).astype(int)
-
-    # --- Create Features from the First Purchase ---
+    # --- 3. Engineer ADVANCED Features ---
+    # Merge seller features
     feature_df = pd.merge(first_purchase_df, seller_df, on='seller_id', how='left')
-    feature_df['first_purchase_month'] = feature_df['order_purchase_timestamp'].dt.month
-    feature_df['first_purchase_dayofweek'] = feature_df['order_purchase_timestamp'].dt.dayofweek
-    
-    feature_df = feature_df[[
-        'customer_unique_id', 'payment_value', 'payment_installments', 'review_score',
-        'freight_value', 'product_category', 'customer_state',
-        'first_purchase_month', 'first_purchase_dayofweek',
-        'seller_avg_review_score', 'seller_num_orders',
-        'delivery_time_vs_estimated', # <-- NEW advanced feature
-        'first_order_was_early'       # <-- NEW advanced feature
-    ]].copy()
-    
-    modeling_df = pd.merge(feature_df, target_df, on='customer_unique_id')
 
-    # Handle missing values
-    # delivery_time_vs_estimated might have NaNs if dates were missing
-    modeling_df['delivery_time_vs_estimated'] = modeling_df['delivery_time_vs_estimated'].fillna(modeling_df['delivery_time_vs_estimated'].median())
-    modeling_df['review_score'] = modeling_df['review_score'].fillna(modeling_df['review_score'].median())
-    modeling_df['seller_avg_review_score'] = modeling_df['seller_avg_review_score'].fillna(modeling_df['seller_avg_review_score'].median())
-    modeling_df['seller_num_orders'] = modeling_df['seller_num_orders'].fillna(0)
-    modeling_df['product_category'] = modeling_df['product_category'].fillna('unknown')
+    # A) Advanced Geospatial: Customer-Seller Distance
+    # Average coordinates for each zip code prefix for efficiency
+    geo_coords = geo_df.groupby('geolocation_zip_code_prefix').agg(
+        lat=('geolocation_lat', 'mean'),
+        lng=('geolocation_lng', 'mean')
+    ).reset_index()
     
-    cat_cols = ['product_category', 'customer_state']
-    modeling_df = pd.get_dummies(modeling_df, columns=cat_cols, drop_first=True, dtype=int)
+    # Merge customer and seller coordinates
+    feature_df = pd.merge(feature_df, geo_coords, left_on='customer_zip_code_prefix', right_on='geolocation_zip_code_prefix', how='left')
+    feature_df.rename(columns={'lat': 'customer_lat', 'lng': 'customer_lng'}, inplace=True)
+    feature_df = pd.merge(feature_df, geo_coords, left_on='seller_zip_code_prefix', right_on='geolocation_zip_code_prefix', how='left')
+    feature_df.rename(columns={'lat': 'seller_lat', 'lng': 'seller_lng'}, inplace=True)
+
+    # Calculate distance, handling potential missing coordinates
+    feature_df['customer_seller_distance'] = feature_df.apply(
+        lambda row: haversine((row['customer_lat'], row['customer_lng']), (row['seller_lat'], row['seller_lng']))
+        if pd.notna(row['customer_lat']) and pd.notna(row['seller_lat']) else np.nan,
+        axis=1
+    )
+
+    # B) Advanced Temporal: Cyclical Features
+    feature_df['month_sin'] = np.sin(2 * np.pi * feature_df['order_purchase_timestamp'].dt.month / 12)
+    feature_df['month_cos'] = np.cos(2 * np.pi * feature_df['order_purchase_timestamp'].dt.month / 12)
+    feature_df['dayofweek_sin'] = np.sin(2 * np.pi * feature_df['order_purchase_timestamp'].dt.dayofweek / 7)
+    feature_df['dayofweek_cos'] = np.cos(2 * np.pi * feature_df['order_purchase_timestamp'].dt.dayofweek / 7)
+
+    # C) State-of-the-Art NLP: Text Embeddings
+    # Fill missing reviews before embedding
+    feature_df['review_comment_message'] = feature_df['review_comment_message'].fillna("no review")
+    
+    # Load a pre-trained model (this will download it on first run)
+    embedding_model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+    
+    # Create embeddings (this can take a few minutes)
+    print("Creating text embeddings for review comments...")
+    embeddings = embedding_model.encode(feature_df['review_comment_message'].to_list(), show_progress_bar=True)
+    
+    # Use PCA to reduce embedding dimensionality to 5 features
+    pca = PCA(n_components=5)
+    embeddings_reduced = pca.fit_transform(embeddings)
+    for i in range(embeddings_reduced.shape[1]):
+        feature_df[f'nlp_feature_{i+1}'] = embeddings_reduced[:, i]
+        
+    # --- 4. Finalizing the Modeling Dataset ---
+    final_features = [
+        'customer_unique_id', 'payment_value', 'payment_installments', 'review_score',
+        'freight_value', 'seller_avg_review_score', 'seller_num_orders',
+        'customer_seller_distance', 'month_sin', 'month_cos', 'dayofweek_sin', 'dayofweek_cos',
+        'nlp_feature_1', 'nlp_feature_2', 'nlp_feature_3', 'nlp_feature_4', 'nlp_feature_5'
+    ]
+    modeling_df = pd.merge(feature_df[final_features], target_df, on='customer_unique_id')
+
+    # Handle any remaining missing values
+    for col in modeling_df.columns:
+        if modeling_df[col].isnull().any():
+            modeling_df[col] = modeling_df[col].fillna(modeling_df[col].median())
 
     print("Final advanced feature engineering complete.")
     return modeling_df
