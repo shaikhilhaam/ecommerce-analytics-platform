@@ -1,0 +1,18 @@
+# Requirements for the prediction API ONLY
+# Core
+pandas
+scikit-learn
+matplotlib
+
+# Database & Model Loading
+sqlalchemy
+psycopg2-binary
+mlflow
+
+# Model
+xgboost
+
+# API Server
+fastapi
+uvicorn[standard]
+python-dotenv

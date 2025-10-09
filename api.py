@@ -3,47 +3,62 @@ import mlflow
 import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel, create_model
+import os
 from pathlib import Path
+import glob
 
-# --- Load the model from the MLflow Model Registry ---
-MODEL_NAME = "review-score-model" # The name we will give our new model in the UI
-MODEL_STAGE = "Production"
+# --- 1. Definitive Model Loading (Bypassing the DB) ---
+# This method finds the model file directly on the container's filesystem.
+# It is robust and independent of the host machine's paths.
+print("Searching for the latest MLflow run to load the model...")
 
-# --- MLflow Setup ---
-# Use the robust pathing from train.py to find the database
-PROJECT_ROOT = Path(__file__).resolve().parent
-db_path = PROJECT_ROOT / "mlflow_data" / "mlflow.db"
-tracking_uri = f"sqlite:///{db_path}"
-mlflow.set_tracking_uri(tracking_uri)
+# The Dockerfile copies everything to /app, so our mlruns folder is at /app/mlruns
+# For local testing, it's in the current directory.
+mlruns_path = Path("./mlruns")
 
-model_uri = f"models:/{MODEL_NAME}/{MODEL_STAGE}"
+# Find the latest experiment ID (highest number)
+experiment_ids = [d.name for d in mlruns_path.iterdir() if d.is_dir() and d.name.isdigit()]
+latest_experiment_id = sorted(experiment_ids, key=int, reverse=True)[0]
 
-print(f"Loading model '{MODEL_NAME}' stage '{MODEL_STAGE}' from the registry...")
-model = mlflow.pyfunc.load_model(model_uri)
+# Find the latest run ID inside that experiment
+latest_run_path = max(
+    (mlruns_path / latest_experiment_id).glob('*'),
+    key=os.path.getmtime
+)
+run_id = latest_run_path.name
+
+# Construct the final path to the model artifact
+model_path = latest_run_path / "artifacts" / "review-score-model"
+print(f"Found latest model in path: {model_path}")
+
+# Load the model directly from this path
+model = mlflow.pyfunc.load_model(str(model_path))
 print("Model loaded successfully.")
 
-# --- Dynamically create the Pydantic model from the MLflow signature ---
+
+# --- 2. Dynamically Create the Input Schema ---
 input_schema = model.metadata.get_input_schema()
 feature_names = [col.name for col in input_schema.inputs]
-type_map = {'int64': int, 'float64': float}
-feature_types = [type_map.get(str(col.type.to_pandas()), float) for col in input_schema.inputs]
+type_map = {'int64': int, 'float64': float, 'bool': bool, 'object': str}
+feature_types = [type_map.get(str(col.type.to_pandas()), str) for col in input_schema.inputs]
+
 pydantic_fields = {name: (dtype, ...) for name, dtype in zip(feature_names, feature_types)}
-OrderFeatures = create_model('OrderFeatures', **pydantic_fields)
+CustomerFeatures = create_model('CustomerFeatures', **pydantic_fields)
 
-# --- Create the FastAPI app ---
-app = FastAPI(title="Review Score Prediction API", version="1.0")
 
-@app.post("/predict_review", tags=["Prediction"])
-def predict_review(features: OrderFeatures):
+# --- 3. Create the FastAPI app ---
+app = FastAPI(title="Customer Review Score API", version="1.0")
+
+@app.post("/predict", tags=["Prediction"])
+def predict(features: CustomerFeatures):
     """
     Receives order features and returns a predicted review score (1-5).
     """
     input_df = pd.DataFrame([features.dict()], columns=feature_names)
-    # The model predicts 0-4, so we add 1 to return a 1-5 score
     prediction = model.predict(input_df)[0] + 1
     return {"predicted_review_score": int(prediction)}
 
 @app.get("/", tags=["Health Check"])
 def read_root():
+    """Root endpoint for health check."""
     return {"message": "API is running. Go to /docs for interactive documentation."}
-
