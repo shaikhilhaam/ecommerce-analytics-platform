@@ -11,6 +11,8 @@ imbalanced-learn
 optuna
 haversine
 lightgbm
+mishap
+shap
 
 # Database Connection
 sqlalchemy
@@ -24,6 +26,8 @@ nbformat
 
 # MLOps - Experiment Tracking
 mlflow
+mlflow[auth]
+PyYAML
 
 # Deep Learning & NLP
 # Note: Installs PyTorch for CPU-only

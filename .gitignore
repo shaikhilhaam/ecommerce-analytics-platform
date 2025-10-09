@@ -39,3 +39,6 @@ Thumbs.db
 # MLflow files
 mlruns/
 mlflow_data/
+
+# Trash folder for old files 
+.trash/
